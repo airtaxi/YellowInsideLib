@@ -36,8 +36,10 @@ public sealed class SessionManager : IDisposable
     Win32.WinEventProc? _winEventDelegate;
     IntPtr _showDestroyHook;
     IntPtr _locationHook;
+    IntPtr _kakaoWatchTimerId;
 
-    const uint WM_INVOKE = Win32.WM_APP + 1;
+    const uint WM_INVOKE            = Win32.WM_APP + 1;
+    const uint KakaoWatchIntervalMs = 1000;
 
     SessionManager() { }
 
@@ -50,9 +52,8 @@ public sealed class SessionManager : IDisposable
         RaiseLog($"[DPI]  PerMonitorV2 설정: {(dpiOk ? "OK" : "실패 또는 이미 설정됨")}");
 
         _kakaoTalkPid = TargetAppHelper.FindProcessId();
-        if (_kakaoTalkPid == 0)
-            throw new InvalidOperationException("메신저 프로세스를 찾을 수 없습니다.");
-        RaiseLog($"[OK]   메신저 PID: {_kakaoTalkPid}");
+        if (_kakaoTalkPid != 0) RaiseLog($"[OK]   메신저 PID: {_kakaoTalkPid}");
+        else RaiseLog("[WARN] 메신저가 실행되어 있지 않습니다 — 실행 후 자동으로 훅을 설치합니다");
 
         _icon = buttonIconPath is not null ? IconHelper.LoadFromFile(buttonIconPath) : null;
         if (_icon != null) RaiseLog("[OK]   아이콘 로드 완료");
@@ -262,6 +263,29 @@ public sealed class SessionManager : IDisposable
         DcconButtonClicked?.Invoke(info);
     }
 
+    // ── 카카오톡 프로세스 감시 (1초 주기 타이머) ─────────────────────────────
+    void CheckKakaoTalkProcess()
+    {
+        uint newPid = TargetAppHelper.FindProcessId();
+        if (newPid == _kakaoTalkPid) return;
+
+        if (_kakaoTalkPid != 0)
+        {
+            UninstallHooks();
+            DetachAll();
+            _kakaoTalkPid = 0;
+            RaiseLog("[INFO] 카카오톡 종료 감지 — 세션 정리 완료");
+        }
+
+        if (newPid != 0)
+        {
+            _kakaoTalkPid = newPid;
+            RaiseLog($"[INFO] 카카오톡 재시작 감지 — 새 PID: {_kakaoTalkPid}");
+            InstallHooks();
+            AttachToExistingWindows();
+        }
+    }
+
     // ── WinEvent 훅 설치/제거 ────────────────────────────────────────────────
     void InstallHooks()
     {
@@ -284,8 +308,8 @@ public sealed class SessionManager : IDisposable
 
     void UninstallHooks()
     {
-        if (_showDestroyHook != IntPtr.Zero) Win32.UnhookWinEvent(_showDestroyHook);
-        if (_locationHook    != IntPtr.Zero) Win32.UnhookWinEvent(_locationHook);
+        if (_showDestroyHook != IntPtr.Zero) { Win32.UnhookWinEvent(_showDestroyHook); _showDestroyHook = IntPtr.Zero; }
+        if (_locationHook    != IntPtr.Zero) { Win32.UnhookWinEvent(_locationHook);    _locationHook    = IntPtr.Zero; }
     }
 
     void OnWinEvent(IntPtr hook, uint eventType, IntPtr hwnd,
@@ -340,8 +364,12 @@ public sealed class SessionManager : IDisposable
             return;
         }
 
-        AttachToExistingWindows();
-        InstallHooks();
+        if (_kakaoTalkPid != 0)
+        {
+            AttachToExistingWindows();
+            InstallHooks();
+        }
+        _kakaoWatchTimerId = Win32.SetTimer(IntPtr.Zero, IntPtr.Zero, KakaoWatchIntervalMs, IntPtr.Zero);
         _startedSignal?.Set();
 
         RaiseLog("[INFO] 메시지 루프 시작");
@@ -352,10 +380,16 @@ public sealed class SessionManager : IDisposable
                 while (_pendingActions.TryDequeue(out var action)) action();
                 continue;
             }
+            if (msg.message == Win32.WM_TIMER && msg.wParam == _kakaoWatchTimerId)
+            {
+                CheckKakaoTalkProcess();
+                continue;
+            }
             Win32.TranslateMessage(in msg);
             Win32.DispatchMessage(in msg);
         }
 
+        Win32.KillTimer(IntPtr.Zero, _kakaoWatchTimerId);
         UninstallHooks();
         DetachAll();
         UnregisterWndClass();
