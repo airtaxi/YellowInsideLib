@@ -159,13 +159,13 @@ static class DcconSender
 
                 // 3. 대상 창 활성화 → 붙여넣기 → 전송
                 Win32.SetForegroundWindow(chatWindowHandle);
-                Thread.Sleep(100);
+                Thread.Sleep(50);
 
                 SimulateCtrlV();
-                Thread.Sleep(500);
+                Thread.Sleep(50);
 
                 SimulateKeyPress(Win32.VK_RETURN);
-                Thread.Sleep(300);
+                Thread.Sleep(50);
 
                 log?.Invoke($"[DCCON] ✓ 클립보드 방식 전송 완료: {filePaths.Count}개 파일");
 
