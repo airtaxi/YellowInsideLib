@@ -19,6 +19,7 @@ public sealed class SessionManager : IDisposable
     public event Action<SessionInfo>? SessionCreated;
     public event Action<SessionInfo>? SessionRemoved;
     public event Action<SessionInfo>? DcconButtonClicked;
+    public event Action? ServiceRestarted;
 
     // ── 내부 상태 ────────────────────────────────────────────────────────────
     readonly Lock _lock = new();
@@ -29,10 +30,18 @@ public sealed class SessionManager : IDisposable
 
     uint    _kakaoTalkPid;
     Image?  _icon;
+    string? _iconPath;
     uint    _uiThreadId;
     Thread? _uiThread;
     bool    _running;
     ManualResetEventSlim? _startedSignal;
+
+    // ── 자동 재시작 관련 ──────────────────────────────────────────────────────
+    const int MaxFailuresBeforeRestart = 3;
+    const int FailureWindowSeconds = 60;
+    int _restarting;  // Interlocked 전용 (0 = 정상, 1 = 재시작 중)
+    readonly List<DateTime> _recentFailures = [];
+    readonly Lock _failureLock = new();
 
     // GC 방지: 네이티브에서 참조하는 델리게이트는 반드시 필드 유지
     Win32.WndProc? _wndProcDelegate;
@@ -60,6 +69,7 @@ public sealed class SessionManager : IDisposable
         if (_kakaoTalkPid != 0) RaiseInfoLog($"메신저 프로세스 발견 — PID: {_kakaoTalkPid}");
         else RaiseWarnLog("메신저가 실행되어 있지 않습니다 — 실행 후 자동으로 훅을 설치합니다");
 
+        _iconPath = buttonIconPath;
         _icon = buttonIconPath is not null ? IconHelper.LoadFromFile(buttonIconPath) : null;
         if (_icon != null) RaiseInfoLog($"아이콘 로드 완료 — {buttonIconPath}");
         else RaiseWarnLog("아이콘 경로 미지정 — 텍스트 폴백 사용");
@@ -136,11 +146,66 @@ public sealed class SessionManager : IDisposable
     // ── 디시콘 전송 ─────────────────────────────────────────────────────────
     public SendMethod SendMethod { get; set; } = SendMethod.Auto;
 
-    public Task SendDcconAsync(IntPtr chatHwnd, string filePath) =>
-        DcconSender.SendDcconAsync(chatHwnd, filePath, SendMethod, _logSink);
+    public async Task<bool> SendDcconAsync(IntPtr chatHwnd, string filePath)
+    {
+        bool success = await DcconSender.SendDcconAsync(chatHwnd, filePath, SendMethod, _logSink);
+        await HandleSendResultAsync(success);
+        return success;
+    }
 
-    public Task SendMultipleDcconsAsync(IntPtr chatHwnd, IEnumerable<string> filePaths) =>
-        DcconSender.SendMultipleDcconsAsync(chatHwnd, filePaths, SendMethod, _logSink);
+    public async Task<bool> SendMultipleDcconsAsync(IntPtr chatHwnd, IEnumerable<string> filePaths)
+    {
+        bool success = await DcconSender.SendMultipleDcconsAsync(chatHwnd, filePaths, SendMethod, _logSink);
+        await HandleSendResultAsync(success);
+        return success;
+    }
+
+    // ── 전송 결과 처리 및 자동 재시작 ────────────────────────────────────────
+
+    async Task HandleSendResultAsync(bool success)
+    {
+        if (success)
+        {
+            lock (_failureLock) { _recentFailures.Clear(); }
+            return;
+        }
+
+        bool shouldRestart;
+        lock (_failureLock)
+        {
+            _recentFailures.Add(DateTime.UtcNow);
+            var cutoff = DateTime.UtcNow.AddSeconds(-FailureWindowSeconds);
+            _recentFailures.RemoveAll(timestamp => timestamp < cutoff);
+            shouldRestart = _recentFailures.Count >= MaxFailuresBeforeRestart;
+        }
+
+        if (shouldRestart && Interlocked.CompareExchange(ref _restarting, 1, 0) == 0)
+        {
+            RaiseWarnLog($"[자동복구] {FailureWindowSeconds}초 내 {MaxFailuresBeforeRestart}회 연속 실패 — 서비스 자동 재시작");
+            await RestartAsync();
+        }
+    }
+
+    async Task RestartAsync()
+    {
+        try
+        {
+            Stop();
+            await Task.Delay(200);
+            Start(_iconPath);
+            lock (_failureLock) { _recentFailures.Clear(); }
+            RaiseInfoLog("[자동복구] ✓ 서비스 재시작 완료");
+            ServiceRestarted?.Invoke();
+        }
+        catch (Exception exception)
+        {
+            RaiseErrorLog($"[자동복구] 서비스 재시작 실패 — {exception.GetType().Name}: {exception.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _restarting, 0);
+        }
+    }
 
     // ── 로그 이벤트 발생 ─────────────────────────────────────────────────────
     void RaiseInfoLog(string message) => InfoLog?.Invoke(message);

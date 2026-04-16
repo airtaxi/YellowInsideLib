@@ -325,19 +325,19 @@ static partial class Win32
     public static unsafe partial uint SendInput(uint numberOfInputs, INPUT* inputs, int sizeOfInput);
 
     // ── 클립보드 ────────────────────────────────────────────────────────────────────────────
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool OpenClipboard(IntPtr hwndNewOwner);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool CloseClipboard();
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool EmptyClipboard();
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", SetLastError = true)]
     public static partial IntPtr SetClipboardData(uint format, IntPtr handle);
 
     [LibraryImport("user32.dll")]
@@ -345,6 +345,9 @@ static partial class Win32
 
     [LibraryImport("user32.dll")]
     public static partial uint EnumClipboardFormats(uint format);
+
+    [LibraryImport("user32.dll")]
+    public static partial uint GetClipboardSequenceNumber();
 
     // ── 메모리 할당 ────────────────────────────────────────────────────────────────────────
     [LibraryImport("kernel32.dll")]
