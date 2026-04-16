@@ -7,8 +7,7 @@ static class DcconSender
 {
     const int ClipboardOpenMaxRetry = 5;
     const int ClipboardOpenRetryDelayMilliseconds = 30;
-    const int ClipboardSequencePollIntervalMilliseconds = 10;
-    const int ClipboardSequencePollTimeoutMilliseconds = 2000;
+    const int PasteSettleDelayMilliseconds = 150;
 
     // ── Public API (하위 호환) ────────────────────────────────────────────────
 
@@ -195,10 +194,7 @@ static class DcconSender
                     return false;
                 }
 
-                // 3. 클립보드 시퀀스 번호 기록 (타겟 앱이 읽었는지 감지용)
-                uint sequenceBeforePaste = Win32.GetClipboardSequenceNumber();
-
-                // 4. 대상 창 활성화 → 붙여넣기
+                // 3. 대상 창 활성화 → 붙여넣기
                 logSink?.Info($"[전송] 클립보드 설정 완료, 입력 시뮬레이션 시작 — SetForegroundWindow → Ctrl+V → Enter");
 
                 if (!Win32.SetForegroundWindow(chatWindowHandle))
@@ -206,19 +202,14 @@ static class DcconSender
 
                 Thread.Sleep(50);
                 SimulateCtrlV();
-
-                // 5. 타겟 앱이 클립보드를 읽을 때까지 대기 (시퀀스 번호 변경 감지)
-                bool targetReadClipboard = WaitForClipboardSequenceChange(sequenceBeforePaste, logSink);
+                Thread.Sleep(PasteSettleDelayMilliseconds);
 
                 SimulateKeyPress(Win32.VK_RETURN);
                 Thread.Sleep(100);
 
-                if (!targetReadClipboard)
-                    logSink?.Warn($"[전송] 클립보드 시퀀스 변경 미감지 — 타겟 앱이 클립보드를 읽지 않았을 수 있음");
-
                 logSink?.Info($"[전송] ✓ 클립보드 방식 전송 완료 — {filePaths.Count}개 파일, 대상: 0x{chatWindowHandle:X8}");
 
-                // 6. 클립보드 복원
+                // 4. 클립보드 복원
                 RestoreClipboard(savedClipboard, logSink);
                 savedClipboard = []; // 복원 완료 → 이중 해제 방지
                 return true;
@@ -244,25 +235,6 @@ static class DcconSender
             int win32Error = Marshal.GetLastWin32Error();
             logSink?.Warn($"[전송] 클립보드 열기 실패 (시도 {attempt + 1}/{ClipboardOpenMaxRetry}) — Win32 error: {win32Error}");
             Thread.Sleep(ClipboardOpenRetryDelayMilliseconds * (attempt + 1));
-        }
-        return false;
-    }
-
-    // ── 클립보드 시퀀스 변경 대기 ────────────────────────────────────────────
-
-    static bool WaitForClipboardSequenceChange(uint previousSequence, LogSink? logSink)
-    {
-        int elapsed = 0;
-        while (elapsed < ClipboardSequencePollTimeoutMilliseconds)
-        {
-            Thread.Sleep(ClipboardSequencePollIntervalMilliseconds);
-            elapsed += ClipboardSequencePollIntervalMilliseconds;
-
-            if (Win32.GetClipboardSequenceNumber() != previousSequence)
-            {
-                logSink?.Info($"[전송] 클립보드 시퀀스 변경 감지 — {elapsed}ms 후 타겟 앱이 클립보드를 읽음");
-                return true;
-            }
         }
         return false;
     }

@@ -346,9 +346,6 @@ static partial class Win32
     [LibraryImport("user32.dll")]
     public static partial uint EnumClipboardFormats(uint format);
 
-    [LibraryImport("user32.dll")]
-    public static partial uint GetClipboardSequenceNumber();
-
     // ── 메모리 할당 ────────────────────────────────────────────────────────────────────────
     [LibraryImport("kernel32.dll")]
     public static partial IntPtr GlobalAlloc(uint flags, nuint bytes);
