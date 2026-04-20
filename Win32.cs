@@ -344,6 +344,16 @@ static partial class Win32
     public static partial IntPtr GetClipboardData(uint format);
 
     [LibraryImport("user32.dll")]
+    public static partial uint GetClipboardSequenceNumber();
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsClipboardFormatAvailable(uint format);
+
+    [LibraryImport("user32.dll", EntryPoint = "RegisterClipboardFormatW", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial uint RegisterClipboardFormat(string format);
+
+    [LibraryImport("user32.dll")]
     public static partial uint EnumClipboardFormats(uint format);
 
     // ── 메모리 할당 ────────────────────────────────────────────────────────────────────────
@@ -425,6 +435,9 @@ static partial class Win32
     public const uint MSGFLT_ADD         = 1;
 
     public const uint CF_HDROP           = 15;
+    public const uint CF_BITMAP          = 2;
+    public const uint CF_DIB             = 8;
+    public const uint CF_DIBV5           = 17;
     public const uint CF_UNICODETEXT     = 13;
     public const uint CF_TEXT            = 1;
 

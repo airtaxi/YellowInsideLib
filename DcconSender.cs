@@ -7,7 +7,16 @@ static class DcconSender
 {
     const int ClipboardOpenMaxRetry = 5;
     const int ClipboardOpenRetryDelayMilliseconds = 30;
-    const int PasteSettleDelayMilliseconds = 150;
+    const int ClipboardImageWaitTimeoutMilliseconds = 1000;
+    const int ClipboardChangePollDelayMilliseconds = 20;
+    const int PasteBeforeEnterDelayMilliseconds = 10;
+
+    static readonly uint s_portableNetworkGraphicsClipboardFormat = Win32.RegisterClipboardFormat("PNG");
+
+    sealed record ClipboardImageWaitContext(
+        ManualResetEventSlim ClipboardImageDetectedSignal,
+        CancellationTokenSource CancellationTokenSource,
+        Task MonitoringTask);
 
     // ── Public API (하위 호환) ────────────────────────────────────────────────
 
@@ -160,52 +169,62 @@ static class DcconSender
                     return false;
                 }
 
-                if (!OpenClipboardWithRetry(logSink))
-                {
-                    Win32.GlobalFree(dropFilesHandle);
-                    logSink?.Error($"[전송] 클립보드 열기 실패 — {ClipboardOpenMaxRetry}회 재시도 후에도 실패");
-                    RestoreClipboard(savedClipboard, logSink);
-                    return false;
-                }
-
-                bool clipboardSetSuccessfully = false;
+                uint clipboardSequenceNumberBeforeClipboardSet = Win32.GetClipboardSequenceNumber();
+                ClipboardImageWaitContext clipboardImageWaitContext = StartClipboardImageWait(clipboardSequenceNumberBeforeClipboardSet);
                 try
                 {
-                    Win32.EmptyClipboard();
-
-                    if (Win32.SetClipboardData(Win32.CF_HDROP, dropFilesHandle) == IntPtr.Zero)
+                    if (!OpenClipboardWithRetry(logSink))
                     {
-                        int win32Error = Marshal.GetLastWin32Error();
                         Win32.GlobalFree(dropFilesHandle);
-                        logSink?.Error($"[전송] 클립보드 데이터 설정 실패 — SetClipboardData(CF_HDROP) 반환값 null (Win32 error: {win32Error})");
+                        logSink?.Error($"[전송] 클립보드 열기 실패 — {ClipboardOpenMaxRetry}회 재시도 후에도 실패");
+                        RestoreClipboard(savedClipboard, logSink);
                         return false;
                     }
-                    // SetClipboardData 성공 → OS가 핸들 소유권을 가져감 (GlobalFree 금지)
-                    clipboardSetSuccessfully = true;
+
+                    bool clipboardSetSuccessfully = false;
+                    try
+                    {
+                        Win32.EmptyClipboard();
+
+                        if (Win32.SetClipboardData(Win32.CF_HDROP, dropFilesHandle) == IntPtr.Zero)
+                        {
+                            int win32Error = Marshal.GetLastWin32Error();
+                            Win32.GlobalFree(dropFilesHandle);
+                            logSink?.Error($"[전송] 클립보드 데이터 설정 실패 — SetClipboardData(CF_HDROP) 반환값 null (Win32 error: {win32Error})");
+                            return false;
+                        }
+                        // SetClipboardData 성공 → OS가 핸들 소유권을 가져감 (GlobalFree 금지)
+                        clipboardSetSuccessfully = true;
+                    }
+                    finally
+                    {
+                        Win32.CloseClipboard();
+                    }
+
+                    if (!clipboardSetSuccessfully)
+                    {
+                        RestoreClipboard(savedClipboard, logSink);
+                        return false;
+                    }
+
+                    WaitForClipboardImageReadyOrTimeout(clipboardImageWaitContext, logSink);
+
+                    // 3. 대상 창 활성화 → 붙여넣기
+                    logSink?.Info($"[전송] 클립보드 준비 완료, 입력 시뮬레이션 시작 — SetForegroundWindow → Ctrl+V → {PasteBeforeEnterDelayMilliseconds}ms → Enter");
+
+                    if (!Win32.SetForegroundWindow(chatWindowHandle))
+                        logSink?.Warn($"[전송] SetForegroundWindow 실패 — 대상: 0x{chatWindowHandle:X8}, 입력이 다른 창으로 전달될 수 있음");
+
+                    Thread.Sleep(10);
+                    SimulateCtrlV();
+                    Thread.Sleep(PasteBeforeEnterDelayMilliseconds);
+                    SimulateKeyPress(Win32.VK_RETURN);
+                    Thread.Sleep(100);
                 }
                 finally
                 {
-                    Win32.CloseClipboard();
+                    StopClipboardImageWait(clipboardImageWaitContext);
                 }
-
-                if (!clipboardSetSuccessfully)
-                {
-                    RestoreClipboard(savedClipboard, logSink);
-                    return false;
-                }
-
-                // 3. 대상 창 활성화 → 붙여넣기
-                logSink?.Info($"[전송] 클립보드 설정 완료, 입력 시뮬레이션 시작 — SetForegroundWindow → Ctrl+V → Enter");
-
-                if (!Win32.SetForegroundWindow(chatWindowHandle))
-                    logSink?.Warn($"[전송] SetForegroundWindow 실패 — 대상: 0x{chatWindowHandle:X8}, 입력이 다른 창으로 전달될 수 있음");
-
-                Thread.Sleep(50);
-                SimulateCtrlV();
-                Thread.Sleep(PasteSettleDelayMilliseconds);
-
-                SimulateKeyPress(Win32.VK_RETURN);
-                Thread.Sleep(100);
 
                 logSink?.Info($"[전송] ✓ 클립보드 방식 전송 완료 — {filePaths.Count}개 파일, 대상: 0x{chatWindowHandle:X8}");
 
@@ -238,6 +257,79 @@ static class DcconSender
         }
         return false;
     }
+
+    static ClipboardImageWaitContext StartClipboardImageWait(uint initialClipboardSequenceNumber)
+    {
+        var clipboardImageDetectedSignal = new ManualResetEventSlim(false);
+        var cancellationTokenSource = new CancellationTokenSource();
+        Task monitoringTask = Task.Run(() => MonitorClipboardForImage(initialClipboardSequenceNumber, clipboardImageDetectedSignal, cancellationTokenSource.Token), cancellationTokenSource.Token);
+        return new ClipboardImageWaitContext(clipboardImageDetectedSignal, cancellationTokenSource, monitoringTask);
+    }
+
+    static void MonitorClipboardForImage(uint initialClipboardSequenceNumber, ManualResetEventSlim clipboardImageDetectedSignal, CancellationToken cancellationToken)
+    {
+        uint lastObservedClipboardSequenceNumber = initialClipboardSequenceNumber;
+
+        while (!cancellationToken.IsCancellationRequested && !clipboardImageDetectedSignal.IsSet)
+        {
+            uint currentClipboardSequenceNumber = Win32.GetClipboardSequenceNumber();
+            if (currentClipboardSequenceNumber != lastObservedClipboardSequenceNumber)
+            {
+                lastObservedClipboardSequenceNumber = currentClipboardSequenceNumber;
+                if (HasImageClipboardFormat())
+                {
+                    clipboardImageDetectedSignal.Set();
+                    return;
+                }
+            }
+
+            cancellationToken.WaitHandle.WaitOne(ClipboardChangePollDelayMilliseconds);
+        }
+    }
+
+    static void WaitForClipboardImageReadyOrTimeout(ClipboardImageWaitContext clipboardImageWaitContext, LogSink? logSink)
+    {
+        long waitStartTickCount = Environment.TickCount64;
+        if (clipboardImageWaitContext.ClipboardImageDetectedSignal.Wait(ClipboardImageWaitTimeoutMilliseconds))
+        {
+            logSink?.Info($"[전송] 클립보드 준비 감지 — {Environment.TickCount64 - waitStartTickCount}ms 대기 후 붙여넣기 진행");
+            return;
+        }
+
+        logSink?.Warn($"[전송] 클립보드 준비 감지 시간 초과 — {ClipboardImageWaitTimeoutMilliseconds}ms 후 강제 붙여넣기 진행");
+    }
+
+    static void StopClipboardImageWait(ClipboardImageWaitContext clipboardImageWaitContext)
+    {
+        clipboardImageWaitContext.CancellationTokenSource.Cancel();
+
+        try
+        {
+            clipboardImageWaitContext.MonitoringTask.Wait();
+        }
+        catch (AggregateException aggregateException) when (ContainsOnlyCancellationException(aggregateException)) { }
+        finally
+        {
+            clipboardImageWaitContext.CancellationTokenSource.Dispose();
+            clipboardImageWaitContext.ClipboardImageDetectedSignal.Dispose();
+        }
+    }
+
+    static bool ContainsOnlyCancellationException(AggregateException aggregateException)
+    {
+        foreach (Exception innerException in aggregateException.InnerExceptions)
+        {
+            if (innerException is not TaskCanceledException && innerException is not OperationCanceledException)
+                return false;
+        }
+        return true;
+    }
+
+    static bool HasImageClipboardFormat() => Win32.IsClipboardFormatAvailable(Win32.CF_HDROP);
+
+    static bool HasPortableNetworkGraphicsClipboardFormat() =>
+        s_portableNetworkGraphicsClipboardFormat != 0
+        && Win32.IsClipboardFormatAvailable(s_portableNetworkGraphicsClipboardFormat);
 
     // ── 클립보드 백업 / 복원 ─────────────────────────────────────────────────
 
