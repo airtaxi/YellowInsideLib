@@ -189,6 +189,9 @@ static partial class Win32
     [LibraryImport("user32.dll")]
     public static partial IntPtr GetParent(IntPtr hwnd);
 
+    [LibraryImport("user32.dll")]
+    public static partial int GetDlgCtrlID(IntPtr hwnd);
+
     // ── WinEvent 훅 ──────────────────────────────────────────────────────────────────────────
     [LibraryImport("user32.dll")]
     public static partial IntPtr SetWinEventHook(

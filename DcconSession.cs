@@ -209,7 +209,7 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
             int ourSize         = toolbarH / 2;                       // 디시콘 버튼 크기 (툴바 50%)
             int ourBtnTop       = toolbarTop + (int)((toolbarH - ourSize) * 0.45);  // 세로 중앙보다 살짝 위
             int ourBtnX         = richRect.Left                       // +/이모티콘/파일 3개 건너뜀
-                                + (int)(kakaoButtonSlot * 2.875)                 // 위치 보정: 추가 버튼 포함 2.875칸
+                                + (int)(kakaoButtonSlot * (IsReplyThreadWindow(chatHwnd) ? 2.125 : 2.875))
                                 + (kakaoButtonSlot - ourSize) / 2;    // 슬롯 내 수평 중앙 정렬
             var pt = new Win32.POINT { X = ourBtnX, Y = ourBtnTop };
             Win32.ScreenToClient(chatHwnd, ref pt);
@@ -227,6 +227,23 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
         };
         Win32.ScreenToClient(chatHwnd, ref fallbackPt);
         return (fallbackPt.X, fallbackPt.Y, fallbackSize);
+    }
+
+    // ── 답장(쓰레드) 창 판별 ─────────────────────────────────────────────────
+    // Edit 클래스(ctrlId=100) 자식이 없으면 쓰레드 창 (보조 구분법)
+    static bool IsReplyThreadWindow(IntPtr chatHwnd)
+    {
+        bool hasEditControl = false;
+        Win32.EnumChildWindows(chatHwnd, (childHwnd, _) =>
+        {
+            if (Win32.GetClassNameString(childHwnd) == "Edit" && Win32.GetDlgCtrlID(childHwnd) == 100)
+            {
+                hasEditControl = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return !hasEditControl;
     }
 
     // ── 툴바 배경색 자동 감지 (버튼 배치 영역 근처 픽셀 샘플링) ──────────────
