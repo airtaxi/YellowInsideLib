@@ -7,16 +7,20 @@ static class DcconSender
 {
     const int ClipboardOpenMaxRetry = 5;
     const int ClipboardOpenRetryDelayMilliseconds = 30;
-    const int ClipboardImageWaitTimeoutMilliseconds = 1000;
+    const int ClipboardFileWaitTimeoutMilliseconds = 1000;
     const int ClipboardChangePollDelayMilliseconds = 20;
     const int PasteBeforeEnterDelayMilliseconds = 10;
+    const uint ClipboardDropEffectCopy = 1;
 
-    static readonly uint s_portableNetworkGraphicsClipboardFormat = Win32.RegisterClipboardFormat("PNG");
+    static readonly uint s_preferredDropEffectClipboardFormat = Win32.RegisterClipboardFormat("Preferred DropEffect");
+    static readonly uint s_fileNameWideClipboardFormat = Win32.RegisterClipboardFormat("FileNameW");
 
-    sealed record ClipboardImageWaitContext(
-        ManualResetEventSlim ClipboardImageDetectedSignal,
+    sealed record ClipboardFileWaitContext(
+        ManualResetEventSlim ClipboardFileDetectedSignal,
         CancellationTokenSource CancellationTokenSource,
         Task MonitoringTask);
+
+    sealed record ClipboardFileDataEntry(uint Format, IntPtr Handle, string FormatName, bool IsRequired);
 
     // ── Public API (하위 호환) ────────────────────────────────────────────────
 
@@ -139,13 +143,14 @@ static class DcconSender
         });
     }
 
-    // ── 클립보드 방식 (CF_HDROP + Ctrl+V + Enter) ────────────────────────────
+    // ── 클립보드 방식 (파일 클립보드 포맷 + Ctrl+V + Enter) ─────────────────
 
     static async Task<bool> SendViaClipboardAsync(IntPtr chatWindowHandle, List<string> filePaths, LogSink? logSink)
     {
         return await Task.Run(() =>
         {
             List<(uint Format, IntPtr Handle)> savedClipboard = [];
+            List<ClipboardFileDataEntry> clipboardFileDataEntries = [];
 
             try
             {
@@ -160,41 +165,32 @@ static class DcconSender
                 // 1. 기존 클립보드 내용 백업
                 savedClipboard = SaveClipboard(logSink);
 
-                // 2. DROPFILES 메모리 구성 → 클립보드에 CF_HDROP 설정
-                IntPtr dropFilesHandle = BuildDropFilesMemory(filePaths);
-                if (dropFilesHandle == IntPtr.Zero)
+                // 2. Explorer 파일 복사와 유사한 클립보드 데이터 구성
+                clipboardFileDataEntries = BuildClipboardFileDataEntries(filePaths, logSink);
+                if (clipboardFileDataEntries.Count == 0)
                 {
                     logSink?.Error($"[전송] 클립보드 방식 DROPFILES 메모리 할당 실패 — GlobalAlloc 반환값 null, 파일 수: {filePaths.Count}개");
                     RestoreClipboard(savedClipboard, logSink);
                     return false;
                 }
 
-                uint clipboardSequenceNumberBeforeClipboardSet = Win32.GetClipboardSequenceNumber();
-                ClipboardImageWaitContext clipboardImageWaitContext = StartClipboardImageWait(clipboardSequenceNumberBeforeClipboardSet);
+                var clipboardSequenceNumberBeforeClipboardSet = Win32.GetClipboardSequenceNumber();
+                var clipboardFileWaitContext = StartClipboardFileWait(clipboardSequenceNumberBeforeClipboardSet);
                 try
                 {
                     if (!OpenClipboardWithRetry(logSink))
                     {
-                        Win32.GlobalFree(dropFilesHandle);
+                        FreeClipboardFileDataEntries(clipboardFileDataEntries);
                         logSink?.Error($"[전송] 클립보드 열기 실패 — {ClipboardOpenMaxRetry}회 재시도 후에도 실패");
                         RestoreClipboard(savedClipboard, logSink);
                         return false;
                     }
 
-                    bool clipboardSetSuccessfully = false;
+                    var clipboardSetSuccessfully = false;
                     try
                     {
                         Win32.EmptyClipboard();
-
-                        if (Win32.SetClipboardData(Win32.CF_HDROP, dropFilesHandle) == IntPtr.Zero)
-                        {
-                            int win32Error = Marshal.GetLastWin32Error();
-                            Win32.GlobalFree(dropFilesHandle);
-                            logSink?.Error($"[전송] 클립보드 데이터 설정 실패 — SetClipboardData(CF_HDROP) 반환값 null (Win32 error: {win32Error})");
-                            return false;
-                        }
-                        // SetClipboardData 성공 → OS가 핸들 소유권을 가져감 (GlobalFree 금지)
-                        clipboardSetSuccessfully = true;
+                        clipboardSetSuccessfully = SetClipboardFileData(clipboardFileDataEntries, logSink);
                     }
                     finally
                     {
@@ -203,17 +199,18 @@ static class DcconSender
 
                     if (!clipboardSetSuccessfully)
                     {
+                        FreeClipboardFileDataEntries(clipboardFileDataEntries);
                         RestoreClipboard(savedClipboard, logSink);
                         return false;
                     }
+                    clipboardFileDataEntries = []; // SetClipboardData 성공 → OS가 핸들 소유권을 가져감
 
-                    WaitForClipboardImageReadyOrTimeout(clipboardImageWaitContext, logSink);
+                    WaitForClipboardFileReadyOrTimeout(clipboardFileWaitContext, logSink);
 
                     // 3. 대상 창 활성화 → 붙여넣기
                     logSink?.Info($"[전송] 클립보드 준비 완료, 입력 시뮬레이션 시작 — SetForegroundWindow → Ctrl+V → {PasteBeforeEnterDelayMilliseconds}ms → Enter");
 
-                    if (!Win32.SetForegroundWindow(chatWindowHandle))
-                        logSink?.Warn($"[전송] SetForegroundWindow 실패 — 대상: 0x{chatWindowHandle:X8}, 입력이 다른 창으로 전달될 수 있음");
+                    if (!Win32.SetForegroundWindow(chatWindowHandle)) logSink?.Warn($"[전송] SetForegroundWindow 실패 — 대상: 0x{chatWindowHandle:X8}, 입력이 다른 창으로 전달될 수 있음");
 
                     Thread.Sleep(10);
                     SimulateCtrlV();
@@ -223,7 +220,7 @@ static class DcconSender
                 }
                 finally
                 {
-                    StopClipboardImageWait(clipboardImageWaitContext);
+                    StopClipboardFileWait(clipboardFileWaitContext);
                 }
 
                 logSink?.Info($"[전송] ✓ 클립보드 방식 전송 완료 — {filePaths.Count}개 파일, 대상: 0x{chatWindowHandle:X8}");
@@ -236,8 +233,9 @@ static class DcconSender
             catch (Exception exception)
             {
                 logSink?.Error($"[전송] 클립보드 전송 중 예외 발생 — 대상: 0x{chatWindowHandle:X8}, {exception.GetType().Name}: {exception.Message}");
-                // 예외 시 백업된 클립보드 핸들 해제
-                foreach (var (_, handle) in savedClipboard) Win32.GlobalFree(handle);
+                FreeClipboardFileDataEntries(clipboardFileDataEntries);
+                RestoreClipboard(savedClipboard, logSink);
+                savedClipboard = [];
                 return false;
             }
         });
@@ -258,27 +256,27 @@ static class DcconSender
         return false;
     }
 
-    static ClipboardImageWaitContext StartClipboardImageWait(uint initialClipboardSequenceNumber)
+    static ClipboardFileWaitContext StartClipboardFileWait(uint initialClipboardSequenceNumber)
     {
-        var clipboardImageDetectedSignal = new ManualResetEventSlim(false);
+        var clipboardFileDetectedSignal = new ManualResetEventSlim(false);
         var cancellationTokenSource = new CancellationTokenSource();
-        Task monitoringTask = Task.Run(() => MonitorClipboardForImage(initialClipboardSequenceNumber, clipboardImageDetectedSignal, cancellationTokenSource.Token), cancellationTokenSource.Token);
-        return new ClipboardImageWaitContext(clipboardImageDetectedSignal, cancellationTokenSource, monitoringTask);
+        var monitoringTask = Task.Run(() => MonitorClipboardForFile(initialClipboardSequenceNumber, clipboardFileDetectedSignal, cancellationTokenSource.Token), cancellationTokenSource.Token);
+        return new ClipboardFileWaitContext(clipboardFileDetectedSignal, cancellationTokenSource, monitoringTask);
     }
 
-    static void MonitorClipboardForImage(uint initialClipboardSequenceNumber, ManualResetEventSlim clipboardImageDetectedSignal, CancellationToken cancellationToken)
+    static void MonitorClipboardForFile(uint initialClipboardSequenceNumber, ManualResetEventSlim clipboardFileDetectedSignal, CancellationToken cancellationToken)
     {
-        uint lastObservedClipboardSequenceNumber = initialClipboardSequenceNumber;
+        var lastObservedClipboardSequenceNumber = initialClipboardSequenceNumber;
 
-        while (!cancellationToken.IsCancellationRequested && !clipboardImageDetectedSignal.IsSet)
+        while (!cancellationToken.IsCancellationRequested && !clipboardFileDetectedSignal.IsSet)
         {
-            uint currentClipboardSequenceNumber = Win32.GetClipboardSequenceNumber();
+            var currentClipboardSequenceNumber = Win32.GetClipboardSequenceNumber();
             if (currentClipboardSequenceNumber != lastObservedClipboardSequenceNumber)
             {
                 lastObservedClipboardSequenceNumber = currentClipboardSequenceNumber;
-                if (HasImageClipboardFormat())
+                if (HasFileClipboardFormat())
                 {
-                    clipboardImageDetectedSignal.Set();
+                    clipboardFileDetectedSignal.Set();
                     return;
                 }
             }
@@ -287,31 +285,31 @@ static class DcconSender
         }
     }
 
-    static void WaitForClipboardImageReadyOrTimeout(ClipboardImageWaitContext clipboardImageWaitContext, LogSink? logSink)
+    static void WaitForClipboardFileReadyOrTimeout(ClipboardFileWaitContext clipboardFileWaitContext, LogSink? logSink)
     {
-        long waitStartTickCount = Environment.TickCount64;
-        if (clipboardImageWaitContext.ClipboardImageDetectedSignal.Wait(ClipboardImageWaitTimeoutMilliseconds))
+        var waitStartTickCount = Environment.TickCount64;
+        if (clipboardFileWaitContext.ClipboardFileDetectedSignal.Wait(ClipboardFileWaitTimeoutMilliseconds))
         {
             logSink?.Info($"[전송] 클립보드 준비 감지 — {Environment.TickCount64 - waitStartTickCount}ms 대기 후 붙여넣기 진행");
             return;
         }
 
-        logSink?.Warn($"[전송] 클립보드 준비 감지 시간 초과 — {ClipboardImageWaitTimeoutMilliseconds}ms 후 강제 붙여넣기 진행");
+        logSink?.Warn($"[전송] 클립보드 준비 감지 시간 초과 — {ClipboardFileWaitTimeoutMilliseconds}ms 후 강제 붙여넣기 진행");
     }
 
-    static void StopClipboardImageWait(ClipboardImageWaitContext clipboardImageWaitContext)
+    static void StopClipboardFileWait(ClipboardFileWaitContext clipboardFileWaitContext)
     {
-        clipboardImageWaitContext.CancellationTokenSource.Cancel();
+        clipboardFileWaitContext.CancellationTokenSource.Cancel();
 
         try
         {
-            clipboardImageWaitContext.MonitoringTask.Wait();
+            clipboardFileWaitContext.MonitoringTask.Wait();
         }
         catch (AggregateException aggregateException) when (ContainsOnlyCancellationException(aggregateException)) { }
         finally
         {
-            clipboardImageWaitContext.CancellationTokenSource.Dispose();
-            clipboardImageWaitContext.ClipboardImageDetectedSignal.Dispose();
+            clipboardFileWaitContext.CancellationTokenSource.Dispose();
+            clipboardFileWaitContext.ClipboardFileDetectedSignal.Dispose();
         }
     }
 
@@ -325,11 +323,87 @@ static class DcconSender
         return true;
     }
 
-    static bool HasImageClipboardFormat() => Win32.IsClipboardFormatAvailable(Win32.CF_HDROP);
+    static bool HasFileClipboardFormat() => Win32.IsClipboardFormatAvailable(Win32.CF_HDROP);
 
-    static bool HasPortableNetworkGraphicsClipboardFormat() =>
-        s_portableNetworkGraphicsClipboardFormat != 0
-        && Win32.IsClipboardFormatAvailable(s_portableNetworkGraphicsClipboardFormat);
+    // ── 파일 클립보드 데이터 구성 ────────────────────────────────────────────
+
+    static List<ClipboardFileDataEntry> BuildClipboardFileDataEntries(List<string> filePaths, LogSink? logSink)
+    {
+        var clipboardFileDataEntries = new List<ClipboardFileDataEntry>();
+        var dropFilesHandle = BuildDropFilesMemory(filePaths);
+        if (dropFilesHandle == IntPtr.Zero) return clipboardFileDataEntries;
+
+        clipboardFileDataEntries.Add(new ClipboardFileDataEntry(Win32.CF_HDROP, dropFilesHandle, "CF_HDROP", IsRequired: true));
+        AddOptionalClipboardFileDataEntry(clipboardFileDataEntries, s_preferredDropEffectClipboardFormat, "Preferred DropEffect", BuildDropEffectMemory, logSink);
+
+        if (filePaths.Count != 1) return clipboardFileDataEntries;
+
+        AddOptionalClipboardFileDataEntry(clipboardFileDataEntries, s_fileNameWideClipboardFormat, "FileNameW", () => BuildUnicodeStringMemory(filePaths[0]), logSink);
+        return clipboardFileDataEntries;
+    }
+
+    static void AddOptionalClipboardFileDataEntry(
+        List<ClipboardFileDataEntry> clipboardFileDataEntries,
+        uint clipboardFormat,
+        string clipboardFormatName,
+        Func<IntPtr> buildClipboardHandle,
+        LogSink? logSink)
+    {
+        if (clipboardFormat == 0)
+        {
+            logSink?.Warn($"[전송] 선택 클립보드 포맷 등록 실패 — {clipboardFormatName}, 확장자 보존 힌트가 약해질 수 있음");
+            return;
+        }
+
+        var clipboardHandle = buildClipboardHandle();
+        if (clipboardHandle == IntPtr.Zero)
+        {
+            logSink?.Warn($"[전송] 선택 클립보드 데이터 구성 실패 — {clipboardFormatName}, 확장자 보존 힌트가 약해질 수 있음");
+            return;
+        }
+
+        clipboardFileDataEntries.Add(new ClipboardFileDataEntry(clipboardFormat, clipboardHandle, clipboardFormatName, IsRequired: false));
+    }
+
+    static bool SetClipboardFileData(List<ClipboardFileDataEntry> clipboardFileDataEntries, LogSink? logSink)
+    {
+        for (var entryIndex = 0; entryIndex < clipboardFileDataEntries.Count; entryIndex++)
+        {
+            var clipboardFileDataEntry = clipboardFileDataEntries[entryIndex];
+            if (clipboardFileDataEntry.Handle == IntPtr.Zero) continue;
+
+            if (Win32.SetClipboardData(clipboardFileDataEntry.Format, clipboardFileDataEntry.Handle) != IntPtr.Zero)
+            {
+                clipboardFileDataEntries[entryIndex] = clipboardFileDataEntry with { Handle = IntPtr.Zero };
+                continue;
+            }
+
+            var win32Error = Marshal.GetLastWin32Error();
+            Win32.GlobalFree(clipboardFileDataEntry.Handle);
+            clipboardFileDataEntries[entryIndex] = clipboardFileDataEntry with { Handle = IntPtr.Zero };
+
+            if (clipboardFileDataEntry.IsRequired)
+            {
+                logSink?.Error($"[전송] 클립보드 데이터 설정 실패 — SetClipboardData({clipboardFileDataEntry.FormatName}) 반환값 null (Win32 error: {win32Error})");
+                return false;
+            }
+
+            logSink?.Warn($"[전송] 선택 클립보드 포맷 설정 실패 — {clipboardFileDataEntry.FormatName}, 확장자 보존 힌트가 약해질 수 있음 (Win32 error: {win32Error})");
+        }
+
+        return true;
+    }
+
+    static void FreeClipboardFileDataEntries(List<ClipboardFileDataEntry> clipboardFileDataEntries)
+    {
+        for (var entryIndex = 0; entryIndex < clipboardFileDataEntries.Count; entryIndex++)
+        {
+            var clipboardFileDataEntry = clipboardFileDataEntries[entryIndex];
+            if (clipboardFileDataEntry.Handle == IntPtr.Zero) continue;
+            Win32.GlobalFree(clipboardFileDataEntry.Handle);
+            clipboardFileDataEntries[entryIndex] = clipboardFileDataEntry with { Handle = IntPtr.Zero };
+        }
+    }
 
     // ── 클립보드 백업 / 복원 ─────────────────────────────────────────────────
 
@@ -465,19 +539,18 @@ static class DcconSender
 
     static unsafe IntPtr BuildDropFilesMemory(List<string> filePaths)
     {
-        uint headerSize = (uint)sizeof(Win32.DROPFILES);
+        var headerSize = (uint)sizeof(Win32.DROPFILES);
 
-        uint totalPathsByteCount = 0;
-        foreach (var path in filePaths)
-            totalPathsByteCount += (uint)((path.Length + 1) * sizeof(char));
+        var totalPathsByteCount = 0u;
+        foreach (var path in filePaths) totalPathsByteCount += (uint)((path.Length + 1) * sizeof(char));
         totalPathsByteCount += sizeof(char); // 이중 null 종료
 
-        uint totalSize = headerSize + totalPathsByteCount;
+        var totalSize = headerSize + totalPathsByteCount;
 
-        IntPtr handle = Win32.GlobalAlloc(Win32.GHND, totalSize);
+        var handle = Win32.GlobalAlloc(Win32.GHND, totalSize);
         if (handle == IntPtr.Zero) return IntPtr.Zero;
 
-        IntPtr lockedPointer = Win32.GlobalLock(handle);
+        var lockedPointer = Win32.GlobalLock(handle);
         if (lockedPointer == IntPtr.Zero)
         {
             Win32.GlobalFree(handle);
@@ -493,7 +566,7 @@ static class DcconSender
             dropFiles->fNC = 0;
             dropFiles->fWide = 1;
 
-            char* destination = (char*)(lockedPointer + (nint)headerSize);
+            var destination = (char*)(lockedPointer + (nint)headerSize);
             foreach (var path in filePaths)
             {
                 path.AsSpan().CopyTo(new Span<char>(destination, path.Length));
@@ -502,6 +575,55 @@ static class DcconSender
                 destination++;
             }
             // GHND = GMEM_ZEROINIT → 이중 null 종료는 자동 처리
+        }
+        finally
+        {
+            Win32.GlobalUnlock(handle);
+        }
+
+        return handle;
+    }
+
+    static unsafe IntPtr BuildDropEffectMemory()
+    {
+        var handle = Win32.GlobalAlloc(Win32.GHND, (nuint)sizeof(uint));
+        if (handle == IntPtr.Zero) return IntPtr.Zero;
+
+        var lockedPointer = Win32.GlobalLock(handle);
+        if (lockedPointer == IntPtr.Zero)
+        {
+            Win32.GlobalFree(handle);
+            return IntPtr.Zero;
+        }
+
+        try
+        {
+            *(uint*)lockedPointer = ClipboardDropEffectCopy;
+        }
+        finally
+        {
+            Win32.GlobalUnlock(handle);
+        }
+
+        return handle;
+    }
+
+    static unsafe IntPtr BuildUnicodeStringMemory(string value)
+    {
+        var byteCount = (nuint)((value.Length + 1) * sizeof(char));
+        var handle = Win32.GlobalAlloc(Win32.GHND, byteCount);
+        if (handle == IntPtr.Zero) return IntPtr.Zero;
+
+        var lockedPointer = Win32.GlobalLock(handle);
+        if (lockedPointer == IntPtr.Zero)
+        {
+            Win32.GlobalFree(handle);
+            return IntPtr.Zero;
+        }
+
+        try
+        {
+            value.AsSpan().CopyTo(new Span<char>(lockedPointer.ToPointer(), value.Length));
         }
         finally
         {
