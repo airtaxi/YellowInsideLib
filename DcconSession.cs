@@ -209,7 +209,8 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
             int ourSize         = toolbarH / 2;                       // 디시콘 버튼 크기 (툴바 50%)
             int ourBtnTop       = toolbarTop + (int)((toolbarH - ourSize) * 0.45);  // 세로 중앙보다 살짝 위
             int ourBtnX         = richRect.Left                       // +/이모티콘/파일 3개 건너뜀
-                                + (int)(kakaoButtonSlot * (IsReplyThreadWindow(chatHwnd) ? 2.125 : 2.875))
+                                // + (int)(kakaoButtonSlot * (IsReplyThreadWindow(chatHwnd) ? 2.125 : 2.875)) -> 카나나 버튼 등 다시 생길 경우 아래 대신 이 코드 사용
+                                + (int)(kakaoButtonSlot * 2.125)
                                 + (kakaoButtonSlot - ourSize) / 2;    // 슬롯 내 수평 중앙 정렬
             var pt = new Win32.POINT { X = ourBtnX, Y = ourBtnTop };
             Win32.ScreenToClient(chatHwnd, ref pt);
