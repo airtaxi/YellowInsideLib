@@ -136,6 +136,37 @@ static partial class Win32
     [LibraryImport("user32.dll")]
     public static partial uint GetDpiForWindow(IntPtr hwnd);
 
+    [LibraryImport("user32.dll")]
+    public static partial uint GetDpiForSystem();
+
+    // 채팅창(다른 프로세스)의 DPI 인식 컨텍스트와 호출 스레드 컨텍스트를 맞추기 위한 API
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr GetThreadDpiAwarenessContext();
+
+    [LibraryImport("user32.dll")]
+    public static partial int GetAwarenessFromDpiAwarenessContext(IntPtr value);
+
+    public static string DescribeDpiAwarenessContext(IntPtr awarenessContext)
+    {
+        if (awarenessContext == IntPtr.Zero) return "UNKNOWN";
+        if (awarenessContext == DPI_CONTEXT_UNAWARE_GDISCALED) return "UNAWARE_GDISCALED";
+        return GetAwarenessFromDpiAwarenessContext(awarenessContext) switch
+        {
+            0 => "UNAWARE",
+            1 => "SYSTEM",
+            2 => "PER_MONITOR",
+            var awareness => $"UNKNOWN({awareness})",
+        };
+    }
+
+    public static bool IsGdiScaledAwarenessContext(IntPtr awarenessContext) => awarenessContext == DPI_CONTEXT_UNAWARE_GDISCALED;
+
     // ── 창 검색 / 열거 ──────────────────────────────────────────────────────────────────────
     [LibraryImport("user32.dll", EntryPoint = "FindWindowW", StringMarshalling = StringMarshalling.Utf16)]
     public static partial IntPtr FindWindow(string? className, string? windowName);
@@ -437,6 +468,11 @@ static partial class Win32
     public const uint GHND               = 0x0042;
     public const uint MSGFLT_ADD         = 1;
 
+    // ── DPI 변경 통지 ─────────────────────────────────────────────────────────────────
+    public const uint WM_DPICHANGED              = 0x02E0;
+    public const uint WM_DPICHANGED_BEFOREPARENT = 0x02E2;
+    public const uint WM_DPICHANGED_AFTERPARENT  = 0x02E3;
+
     public const uint CF_HDROP           = 15;
     public const uint CF_BITMAP          = 2;
     public const uint CF_DIB             = 8;
@@ -448,6 +484,7 @@ static partial class Win32
     public const byte VK_V              = 0x56;
     public const byte VK_RETURN         = 0x0D;
 
-    public static readonly IntPtr DPI_CONTEXT_PER_MONITOR_V2 = new IntPtr(-4);
-    public static readonly IntPtr HWND_TOP                   = IntPtr.Zero;
+    public static readonly IntPtr DPI_CONTEXT_PER_MONITOR_V2    = new IntPtr(-4);
+    public static readonly IntPtr DPI_CONTEXT_UNAWARE_GDISCALED = new IntPtr(-5);
+    public static readonly IntPtr HWND_TOP                      = IntPtr.Zero;
 }

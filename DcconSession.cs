@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 namespace YellowInsideLib;
 
 // ──── 채팅창 1개에 대응하는 디시콘 버튼 세션 ──────────────────────────────
-sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
+sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
 {
     const uint TimerId = 1;
 
@@ -14,6 +14,8 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
 
     public Action<DcconSession>? Clicked { get; set; }
 
+    int     _clientX;
+    int     _clientY;
     int     _size;
     bool    _hovered;
     bool    _pressed;
@@ -22,13 +24,25 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
     Bitmap? _bmpNormal;
     Bitmap? _bmpHovered;
     Bitmap? _bmpPressed;
+    IntPtr  _coordinateSpaceContext;   // 버튼 좌표를 계산한 공간(채팅창의 DPI 인식 컨텍스트)
+    uint    _coordinateSpaceDpi;       // 같은 시점의 채팅창 DPI
+    double  _deviceScale = 1.0;        // 좌표 1단위가 실제 화면에서 차지하는 픽셀 수
 
     // ── 버튼 생성 ────────────────────────────────────────────────────────────
-    public bool CreateButton(Image? icon)
+    public bool CreateButton()
     {
+        // 채팅창과 같은 DPI 인식 컨텍스트에서 계산하고 생성해야 좌표 공간이 일치한다.
+        // 어긋난 상태로 자식 창을 만들면 Windows가 프로세스의 기존 창들까지 채팅창의
+        // 인식 모드로 강제 변환하며, 버튼 좌표와 비트맵 크기가 서로 다른 공간 기준이 되어 잘린다.
+        using var dpiScope = ThreadDpiAwarenessScope.EnterForWindow(ChatHwnd);
+        if (!dpiScope.IsActive) logSink?.Warn($"[DPI] 0x{ChatHwnd:X8} 채팅창 DPI 인식 컨텍스트 전환 실패 — 호출 스레드 컨텍스트로 계산합니다");
+
         var (clientX, clientY, size) = CalcButtonPosition(ChatHwnd, logSink);
+        _clientX = clientX;
+        _clientY = clientY;
         _size = size;
-        CreateBitmaps(icon);
+        RefreshCoordinateSpace();
+        CreateBitmaps();
 
         ButtonHwnd = Win32.CreateWindowEx(
             0, SessionManager.ButtonWndClassName, "",
@@ -39,6 +53,7 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
 
         if (ButtonHwnd == IntPtr.Zero) return false;
 
+        logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 채팅창 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x, 버튼: {size}px @ ({clientX},{clientY})");
         Win32.SetTimer(ButtonHwnd, new IntPtr(TimerId), 16, IntPtr.Zero);
         return true;
     }
@@ -54,13 +69,59 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
         DisposeBitmaps();
     }
 
-    // ── 위치 갱신 (채팅창 이동·리사이즈 시) ─────────────────────────────────
-    public void UpdatePosition(Image? icon)
+    // ── 위치 갱신 (채팅창 이동·리사이즈·DPI 변경 시) ─────────────────────────
+    public void UpdatePosition()
     {
         if (ButtonHwnd == IntPtr.Zero) return;
+
+        using var dpiScope = ThreadDpiAwarenessScope.EnterForWindow(ChatHwnd);
+
         var (clientX, clientY, newSize) = CalcButtonPosition(ChatHwnd, logSink);
-        if (newSize != _size) { _size = newSize; CreateBitmaps(icon); }
+        if (newSize <= 0) return;   // 창 정리 중 등 좌표가 유효하지 않은 순간은 건너뛴다
+
+        bool sizeChanged = newSize != _size;
+        bool spaceChanged = RefreshCoordinateSpace();
+
+        if (!sizeChanged && !spaceChanged && clientX == _clientX && clientY == _clientY) return;
+
+        if (sizeChanged || spaceChanged)
+        {
+            logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 버튼 재생성 — 크기 {_size}px → {newSize}px, 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x");
+            _size = newSize;
+            CreateBitmaps();
+        }
+
+        _clientX = clientX;
+        _clientY = clientY;
         Win32.MoveWindow(ButtonHwnd, clientX, clientY, _size, _size, true);
+        Win32.InvalidateRect(ButtonHwnd, IntPtr.Zero, false);
+    }
+
+    // ── 좌표 공간 기억 / 변경 감지 ───────────────────────────────────────────
+    bool RefreshCoordinateSpace()
+    {
+        IntPtr awarenessContext = Win32.GetWindowDpiAwarenessContext(ChatHwnd);
+        uint windowDpi = Win32.GetDpiForWindow(ChatHwnd);
+        double deviceScale = MeasureDeviceScale(ChatHwnd);
+
+        bool changed = awarenessContext != _coordinateSpaceContext || windowDpi != _coordinateSpaceDpi || Math.Abs(deviceScale - _deviceScale) > 0.01;
+
+        _coordinateSpaceContext = awarenessContext;
+        _coordinateSpaceDpi = windowDpi;
+        _deviceScale = deviceScale;
+        return changed;
+    }
+
+    // 좌표 1단위가 실제 화면에서 차지하는 픽셀 수를 측정한다.
+    // GDI 스케일링이 적용된 채팅창에서는 좌표 공간이 96 DPI 기준으로 보고되므로 이 값이 1보다 커진다.
+    static double MeasureDeviceScale(IntPtr hwnd)
+    {
+        if (!Win32.GetWindowRect(hwnd, out var coordinateRect) || coordinateRect.Width <= 0) return 1.0;
+
+        using var physicalScope = ThreadDpiAwarenessScope.Enter(Win32.DPI_CONTEXT_PER_MONITOR_V2);
+        if (!Win32.GetWindowRect(hwnd, out var physicalRect) || physicalRect.Width <= 0) return 1.0;
+
+        return Math.Clamp((double)physicalRect.Width / coordinateRect.Width, 0.5, 4.0);
     }
 
     // ── WndProc 메시지 처리 ───────────────────────────────────────────────────
@@ -72,7 +133,11 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
             {
                 var paintStruct = new Win32.PAINTSTRUCT();
                 IntPtr hdc = Win32.BeginPaint(hwnd, ref paintStruct);
-                using (var graphics = Graphics.FromHdc(hdc)) PaintButton(graphics);
+                using (var graphics = Graphics.FromHdc(hdc))
+                {
+                    Win32.GetClientRect(hwnd, out var clientRect);
+                    PaintButton(graphics, clientRect.Width, clientRect.Height);
+                }
                 Win32.EndPaint(hwnd, in paintStruct);
                 return IntPtr.Zero;
             }
@@ -107,6 +172,15 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
                 _hovered = _pressed = _trackingMouse = false;
                 Win32.InvalidateRect(hwnd, IntPtr.Zero, false);
                 return IntPtr.Zero;
+            case Win32.WM_DPICHANGED:
+            case Win32.WM_DPICHANGED_AFTERPARENT:
+                // 채팅창이 DPI 변경을 통지하면 버튼 좌표와 비트맵을 새 공간 기준으로 다시 만든다.
+                // (WM_DPICHANGED_BEFOREPARENT 는 부모 재배치 전이므로 무시하고, 부모의 후속
+                //  위치 변경 이벤트와 주기 검증이 최종 좌표를 확정한다)
+                UpdatePosition();
+                return IntPtr.Zero;
+            case Win32.WM_DPICHANGED_BEFOREPARENT:
+                return IntPtr.Zero;
             case Win32.WM_TIMER:
                 // EVA BitBlt이 버튼을 덮은 뒤 최대 16ms 이내 복구
                 Win32.SetWindowPos(hwnd, Win32.HWND_TOP, 0, 0, 0, 0,
@@ -123,20 +197,33 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
     }
 
     // ── 렌더링 ───────────────────────────────────────────────────────────────
-    void PaintButton(Graphics graphics)
+    void PaintButton(Graphics graphics, int clientWidth, int clientHeight)
     {
-        Bitmap? bmp = _pressed ? _bmpPressed : _hovered ? _bmpHovered : _bmpNormal;
-        if (bmp != null) { graphics.DrawImageUnscaled(bmp, 0, 0); return; }
-        graphics.Clear(_toolbarBackground);
+        Bitmap? bitmap = _pressed ? _bmpPressed : _hovered ? _bmpHovered : _bmpNormal;
+        if (bitmap == null)
+        {
+            graphics.Clear(_toolbarBackground);
+            return;
+        }
+
+        // 항상 목적 사각형을 지정해 그린다.
+        // DrawImageUnscaled 는 이미지 DPI와 DC DPI가 다르면 배율을 한 번 더 곱하므로
+        // (예: 96 DPI 비트맵을 192 DPI DC 에 그리면 2배) 아이콘이 확대되어 잘려 보인다.
+        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        graphics.DrawImage(bitmap, new Rectangle(0, 0, Math.Max(clientWidth, 1), Math.Max(clientHeight, 1)));
     }
 
-    void CreateBitmaps(Image? icon)
+    void CreateBitmaps()
     {
         DisposeBitmaps();
         _toolbarBackground = SampleToolbarBackgroundColor(ChatHwnd);
-        _bmpNormal  = RenderButtonToBitmap(1.0f, icon);
-        _bmpHovered = RenderButtonToBitmap(0.85f, icon);
-        _bmpPressed = RenderButtonToBitmap(0.70f, icon);
+
+        // 화면 배율만큼 큰 비트맵을 만들어 두고 그릴 때 목적 크기로 축소한다.
+        // 이렇게 하면 좌표 공간이 96 DPI 기준으로 보고되는 환경에서도 아이콘이 선명하게 그려진다.
+        int bitmapSize = Math.Max((int)Math.Round(_size * _deviceScale), 1);
+        _bmpNormal  = RenderButtonToBitmap(1.0f, bitmapSize);
+        _bmpHovered = RenderButtonToBitmap(0.85f, bitmapSize);
+        _bmpPressed = RenderButtonToBitmap(0.70f, bitmapSize);
     }
 
     void DisposeBitmaps()
@@ -146,10 +233,10 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
         _bmpPressed?.Dispose(); _bmpPressed = null;
     }
 
-    Bitmap RenderButtonToBitmap(float iconOpacity, Image? icon)
+    Bitmap RenderButtonToBitmap(float iconOpacity, int size)
     {
-        int size = Math.Max(_size, 1);
         var bitmap = new Bitmap(size, size);
+        bitmap.SetResolution(96, 96);   // 이미지 DPI 차이로 인한 배율 왜곡 방지
         using var graphics = Graphics.FromImage(bitmap);
         graphics.Clear(_toolbarBackground);
         if (icon != null)
@@ -179,10 +266,11 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
         }
         else
         {
-            using var font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            // 아이콘이 없을 때의 텍스트 폴백도 비트맵 배율에 맞춰 크기를 조정한다
+            float bitmapScale = size / (float)Math.Max(_size, 1);
+            using var font = new Font("Segoe UI", 7.5f * bitmapScale, FontStyle.Bold);
             var textSize = graphics.MeasureString("Dc", font);
-            graphics.DrawString("Dc", font, Brushes.LightGray,
-                (size - textSize.Width) / 2f, (size - textSize.Height) / 2f);
+            graphics.DrawString("Dc", font, Brushes.LightGray, (size - textSize.Width) / 2f, (size - textSize.Height) / 2f);
         }
         return bitmap;
     }
@@ -201,7 +289,8 @@ sealed class DcconSession(IntPtr chatHwnd, LogSink? logSink = null)
             return false;
         }, IntPtr.Zero);
 
-        if (richRect.Width > 0)
+        // 창이 정리되는 중에는 리치에디트 사각형이 일시적으로 어긋날 수 있으므로 툴바 높이를 검증한다
+        if (richRect.Width > 0 && richRect.Bottom < wndRect.Bottom)
         {
             int toolbarTop      = richRect.Bottom;
             int toolbarH        = wndRect.Bottom - toolbarTop;

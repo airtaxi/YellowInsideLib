@@ -65,6 +65,9 @@ public sealed class SessionManager : IDisposable
 
         bool dpiOk = Win32.SetProcessDpiAwarenessContext(Win32.DPI_CONTEXT_PER_MONITOR_V2);
         RaiseInfoLog($"[DPI]  PerMonitorV2 DPI 인식 설정: {(dpiOk ? "성공" : "실패 또는 이미 설정됨")}");
+        IntPtr threadAwarenessContext = Win32.GetThreadDpiAwarenessContext();
+        RaiseInfoLog($"[DPI]  현재 스레드 인식: {Win32.DescribeDpiAwarenessContext(threadAwarenessContext)}, 시스템 DPI: {Win32.GetDpiForSystem()}");
+        if (Win32.IsGdiScaledAwarenessContext(threadAwarenessContext)) RaiseWarnLog("[DPI]  GDI 스케일링(System (Enhanced)) 모드입니다 — exe 호환성 설정에서 '높은 DPI 설정 재정의'를 해제해야 버튼이 올바르게 그려집니다");
         _kakaoTalkPid = TargetAppHelper.FindProcessId();
         if (_kakaoTalkPid != 0) RaiseInfoLog($"메신저 프로세스 발견 — PID: {_kakaoTalkPid}");
         else RaiseWarnLog("메신저가 실행되어 있지 않습니다 — 실행 후 자동으로 훅을 설치합니다");
@@ -286,9 +289,9 @@ public sealed class SessionManager : IDisposable
     {
         lock (_lock) { if (_sessions.ContainsKey(chatHwnd)) return; }
 
-        var session = new DcconSession(chatHwnd, _logSink) { Clicked = OnSessionButtonClicked };
+        var session = new DcconSession(chatHwnd, _icon, _logSink) { Clicked = OnSessionButtonClicked };
 
-        if (!session.CreateButton(_icon))
+        if (!session.CreateButton())
         {
             int win32Error = Marshal.GetLastWin32Error();
             RaiseErrorLog($"0x{chatHwnd:X8}: 버튼 생성 실패 — Win32 error: {win32Error}");
@@ -339,6 +342,14 @@ public sealed class SessionManager : IDisposable
         var info = CreateSessionInfo(session.ChatHwnd, true);
         RaiseInfoLog($"★ 디시콘 버튼 클릭 — 채팅방: 0x{session.ChatHwnd:X8}, 제목: '{info.Title}' ({DateTime.Now:HH:mm:ss.fff})");
         DcconButtonClicked?.Invoke(info);
+    }
+
+    // ── 주기적 버튼 좌표 재검증 (DPI 변경·레이아웃 변경 안전망) ────────────────
+    void ValidateSessionGeometry()
+    {
+        List<DcconSession> sessions;
+        lock (_lock) sessions = [.._sessions.Values];
+        foreach (var session in sessions) session.UpdatePosition();
     }
 
     // ── 카카오톡 프로세스 감시 (1초 주기 타이머) ─────────────────────────────
@@ -408,11 +419,9 @@ public sealed class SessionManager : IDisposable
             case Win32.EVENT_OBJECT_LOCATIONCHANGE:
                 DcconSession? session;
                 lock (_lock) { _sessions.TryGetValue(hwnd, out session); }
-                if (session != null && !Win32.IsIconic(hwnd))
-                    session.UpdatePosition(_icon);
                 // SHOW 이벤트 타이밍 상 RICHEDIT50W가 아직 없어 세션 미생성된 채팅창 재시도
-                else if (session == null && IsChatWindow(hwnd))
-                    AttachSession(hwnd);
+                if (session != null && !Win32.IsIconic(hwnd)) session.UpdatePosition();
+                else if (session == null && IsChatWindow(hwnd)) AttachSession(hwnd);
                 break;
         }
     }
@@ -461,6 +470,7 @@ public sealed class SessionManager : IDisposable
             if (msg.message == Win32.WM_TIMER && msg.wParam == _kakaoWatchTimerId)
             {
                 CheckKakaoTalkProcess();
+                ValidateSessionGeometry();
                 continue;
             }
             Win32.TranslateMessage(in msg);
