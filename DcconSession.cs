@@ -5,18 +5,20 @@ using System.Runtime.InteropServices;
 namespace YellowInsideLib;
 
 // ──── 채팅창 1개에 대응하는 디시콘 버튼 세션 ──────────────────────────────
-sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
+sealed class DcconSession(IntPtr chatHwnd, Image? icon, IButtonLayoutSource layoutSource, LogSink? logSink = null)
 {
     const uint TimerId = 1;
 
     public IntPtr ChatHwnd   { get; }      = chatHwnd;
     public IntPtr ButtonHwnd { get; private set; }
+    public IButtonLayoutSource LayoutSource { get; } = layoutSource;
 
     public Action<DcconSession>? Clicked { get; set; }
 
     int     _clientX;
     int     _clientY;
     int     _size;
+    float   _iconScale = 1.0f;
     bool    _hovered;
     bool    _pressed;
     bool    _trackingMouse;
@@ -24,6 +26,7 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
     Bitmap? _bmpNormal;
     Bitmap? _bmpHovered;
     Bitmap? _bmpPressed;
+    Win32.POINT _backgroundSampleClientPoint;   // 버튼 배경색을 샘플링할 툴바 위치 (채팅창 클라이언트 좌표)
     IntPtr  _coordinateSpaceContext;   // 버튼 좌표를 계산한 공간(채팅창의 DPI 인식 컨텍스트)
     uint    _coordinateSpaceDpi;       // 같은 시점의 채팅창 DPI
     double  _deviceScale = 1.0;        // 좌표 1단위가 실제 화면에서 차지하는 픽셀 수
@@ -37,24 +40,21 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
         using var dpiScope = ThreadDpiAwarenessScope.EnterForWindow(ChatHwnd);
         if (!dpiScope.IsActive) logSink?.Warn($"[DPI] 0x{ChatHwnd:X8} 채팅창 DPI 인식 컨텍스트 전환 실패 — 호출 스레드 컨텍스트로 계산합니다");
 
-        var (clientX, clientY, size) = CalcButtonPosition(ChatHwnd, logSink);
-        _clientX = clientX;
-        _clientY = clientY;
-        _size = size;
+        if (LayoutSource.CalculateLayout(ChatHwnd, logSink) is not { Size: > 0 } layout)
+        {
+            logSink?.Warn($"0x{ChatHwnd:X8}: 버튼 위치를 계산할 수 없음 — 버튼 생성 보류");
+            return false;
+        }
+
+        ApplyLayout(layout);
         RefreshCoordinateSpace();
         CreateBitmaps();
 
-        ButtonHwnd = Win32.CreateWindowEx(
-            0, SessionManager.ButtonWndClassName, "",
-            (uint)(Win32.WS_CHILD | Win32.WS_VISIBLE),
-            clientX, clientY, size, size,
-            ChatHwnd, IntPtr.Zero,
-            Win32.GetModuleHandle(IntPtr.Zero), IntPtr.Zero);
-
+        ButtonHwnd = Win32.CreateWindowEx(0, SessionManager.ButtonWndClassName, "", (uint)(Win32.WS_CHILD | Win32.WS_VISIBLE), _clientX, _clientY, _size, _size, ChatHwnd, IntPtr.Zero, Win32.GetModuleHandle(IntPtr.Zero), IntPtr.Zero);
         if (ButtonHwnd == IntPtr.Zero) return false;
 
-        logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 채팅창 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x, 버튼: {size}px @ ({clientX},{clientY})");
-        Win32.SetTimer(ButtonHwnd, new IntPtr(TimerId), 16, IntPtr.Zero);
+        logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 채팅창 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x, 버튼: {_size}px @ ({_clientX},{_clientY})");
+        if (LayoutSource.RequiresPeriodicZOrderRefresh) Win32.SetTimer(ButtonHwnd, new IntPtr(TimerId), 16, IntPtr.Zero);
         return true;
     }
 
@@ -76,24 +76,46 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
 
         using var dpiScope = ThreadDpiAwarenessScope.EnterForWindow(ChatHwnd);
 
-        var (clientX, clientY, newSize) = CalcButtonPosition(ChatHwnd, logSink);
-        if (newSize <= 0) return;   // 창 정리 중 등 좌표가 유효하지 않은 순간은 건너뛴다
+        // 창 정리 중 등 좌표가 유효하지 않은 순간은 건너뛴다
+        if (LayoutSource.CalculateLayout(ChatHwnd, logSink) is not { Size: > 0 } layout) return;
+        _backgroundSampleClientPoint = layout.BackgroundSampleClientPoint;
 
-        bool sizeChanged = newSize != _size;
-        bool spaceChanged = RefreshCoordinateSpace();
+        var sizeChanged = layout.Size != _size || layout.IconScale != _iconScale;
+        var spaceChanged = RefreshCoordinateSpace();
 
-        if (!sizeChanged && !spaceChanged && clientX == _clientX && clientY == _clientY) return;
+        if (!sizeChanged && !spaceChanged && layout.ClientX == _clientX && layout.ClientY == _clientY) return;
 
+        var previousSize = _size;
+        ApplyLayout(layout);
         if (sizeChanged || spaceChanged)
         {
-            logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 버튼 재생성 — 크기 {_size}px → {newSize}px, 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x");
-            _size = newSize;
+            logSink?.Info($"[DPI] 0x{ChatHwnd:X8} 버튼 재생성 — 크기 {previousSize}px → {_size}px, 인식: {Win32.DescribeDpiAwarenessContext(_coordinateSpaceContext)}, 채팅창 DPI: {_coordinateSpaceDpi}, 물리 배율: {_deviceScale:F2}x");
             CreateBitmaps();
         }
 
-        _clientX = clientX;
-        _clientY = clientY;
-        Win32.MoveWindow(ButtonHwnd, clientX, clientY, _size, _size, true);
+        Win32.MoveWindow(ButtonHwnd, _clientX, _clientY, _size, _size, true);
+        Win32.InvalidateRect(ButtonHwnd, IntPtr.Zero, false);
+    }
+
+    void ApplyLayout(ButtonLayout layout)
+    {
+        _clientX = layout.ClientX;
+        _clientY = layout.ClientY;
+        _size = layout.Size;
+        _iconScale = layout.IconScale;
+        _backgroundSampleClientPoint = layout.BackgroundSampleClientPoint;
+    }
+
+    // ── 툴바 배경색 재확인 (테마 변경, 생성 시점에 다른 창에 가려졌던 경우 보정) ──
+    // 채팅창이 전경 창일 때만 샘플링해서 다른 창의 픽셀을 배경색으로 잘못 읽지 않도록 한다
+    public void RefreshBackgroundColor()
+    {
+        if (ButtonHwnd == IntPtr.Zero || Win32.GetForegroundWindow() != ChatHwnd) return;
+
+        using var dpiScope = ThreadDpiAwarenessScope.EnterForWindow(ChatHwnd);
+        if (SampleToolbarBackgroundColor(ChatHwnd, _backgroundSampleClientPoint).ToArgb() == _toolbarBackground.ToArgb()) return;
+
+        CreateBitmaps();
         Win32.InvalidateRect(ButtonHwnd, IntPtr.Zero, false);
     }
 
@@ -216,7 +238,7 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
     void CreateBitmaps()
     {
         DisposeBitmaps();
-        _toolbarBackground = SampleToolbarBackgroundColor(ChatHwnd);
+        _toolbarBackground = SampleToolbarBackgroundColor(ChatHwnd, _backgroundSampleClientPoint);
 
         // 화면 배율만큼 큰 비트맵을 만들어 두고 그릴 때 목적 크기로 축소한다.
         // 이렇게 하면 좌표 공간이 96 DPI 기준으로 보고되는 환경에서도 아이콘이 선명하게 그려진다.
@@ -241,6 +263,10 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
         graphics.Clear(_toolbarBackground);
         if (icon != null)
         {
+            // 아이콘은 버튼 가운데에 IconScale 비율 크기로 그린다 (주변 메신저 아이콘과 크기를 맞춤)
+            var iconSize = Math.Max((int)Math.Round(size * _iconScale), 1);
+            var iconOffset = (size - iconSize) / 2;
+            var iconRectangle = new Rectangle(iconOffset, iconOffset, iconSize, iconSize);
             graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
             if (iconOpacity < 1.0f)
             {
@@ -254,15 +280,9 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
                     [0, 0, 0, 0,           1],
                 ];
                 attributes.SetColorMatrix(new System.Drawing.Imaging.ColorMatrix(matrix));
-                graphics.DrawImage(icon,
-                    new Rectangle(0, 0, size, size),
-                    0, 0, icon.Width, icon.Height,
-                    GraphicsUnit.Pixel, attributes);
+                graphics.DrawImage(icon, iconRectangle, 0, 0, icon.Width, icon.Height, GraphicsUnit.Pixel, attributes);
             }
-            else
-            {
-                graphics.DrawImage(icon, 0, 0, size, size);
-            }
+            else graphics.DrawImage(icon, iconRectangle);
         }
         else
         {
@@ -275,81 +295,18 @@ sealed class DcconSession(IntPtr chatHwnd, Image? icon, LogSink? logSink = null)
         return bitmap;
     }
 
-    // ── 버튼 위치 계산 (물리픽셀 screen → chatWindow client 좌표) ────────────
-    // kakaoButton = toolbarH - 10 은 실제 버튼 폭보다 ~1.5배 크게 추정됨
-    // 따라서 * 2 가 경험적으로 (+, 이모티콘, 파일) 3개 건너뛰기에 해당함
-    public static (int clientX, int clientY, int size) CalcButtonPosition(IntPtr chatHwnd, LogSink? logSink = null)
-    {
-        Win32.GetWindowRect(chatHwnd, out var wndRect);
-        Win32.RECT richRect = default;
-        Win32.EnumChildWindows(chatHwnd, (childHwnd, _) =>
-        {
-            if (Win32.GetClassNameString(childHwnd) != "RICHEDIT50W") return true;
-            Win32.GetWindowRect(childHwnd, out richRect);
-            return false;
-        }, IntPtr.Zero);
-
-        // 창이 정리되는 중에는 리치에디트 사각형이 일시적으로 어긋날 수 있으므로 툴바 높이를 검증한다
-        if (richRect.Width > 0 && richRect.Bottom < wndRect.Bottom)
-        {
-            int toolbarTop      = richRect.Bottom;
-            int toolbarH        = wndRect.Bottom - toolbarTop;
-            int kakaoButtonSlot = (int)(toolbarH * 0.875);            // 메신저 버튼 슬롯 폭 (비율 기반, DPI 독립)
-            int ourSize         = toolbarH / 2;                       // 디시콘 버튼 크기 (툴바 50%)
-            int ourBtnTop       = toolbarTop + (int)((toolbarH - ourSize) * 0.45);  // 세로 중앙보다 살짝 위
-            int ourBtnX         = richRect.Left                       // +/이모티콘/파일 3개 건너뜀
-                                // + (int)(kakaoButtonSlot * (IsReplyThreadWindow(chatHwnd) ? 2.125 : 2.875)) -> 카나나 버튼 등 다시 생길 경우 아래 대신 이 코드 사용
-                                + (int)(kakaoButtonSlot * 2.125)
-                                + (kakaoButtonSlot - ourSize) / 2;    // 슬롯 내 수평 중앙 정렬
-            var pt = new Win32.POINT { X = ourBtnX, Y = ourBtnTop };
-            Win32.ScreenToClient(chatHwnd, ref pt);
-            return (pt.X, pt.Y, ourSize);
-        }
-
-        uint windowDpi = Win32.GetDpiForWindow(chatHwnd);
-        double dpiScale = windowDpi / 96.0;
-        logSink?.Warn($"0x{chatHwnd:X8}: RICHEDIT50W 앵커 없음 — DPI 기반 폴백 사용 (DPI: {windowDpi}, scale: {dpiScale:F2}x)");
-        int fallbackSize = (int)(18 * dpiScale);
-        var fallbackPt = new Win32.POINT
-        {
-            X = wndRect.Left + (int)(39 * dpiScale),
-            Y = wndRect.Bottom - (int)(21 * dpiScale),
-        };
-        Win32.ScreenToClient(chatHwnd, ref fallbackPt);
-        return (fallbackPt.X, fallbackPt.Y, fallbackSize);
-    }
-
-    // ── 답장(쓰레드) 창 판별 ─────────────────────────────────────────────────
-    // Edit 클래스(ctrlId=100) 자식이 없으면 쓰레드 창 (보조 구분법)
-    static bool IsReplyThreadWindow(IntPtr chatHwnd)
-    {
-        bool hasEditControl = false;
-        Win32.EnumChildWindows(chatHwnd, (childHwnd, _) =>
-        {
-            if (Win32.GetClassNameString(childHwnd) == "Edit" && Win32.GetDlgCtrlID(childHwnd) == 100)
-            {
-                hasEditControl = true;
-                return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return !hasEditControl;
-    }
-
     // ── 툴바 배경색 자동 감지 (버튼 배치 영역 근처 픽셀 샘플링) ──────────────
-    static Color SampleToolbarBackgroundColor(IntPtr chatHwnd)
+    static Color SampleToolbarBackgroundColor(IntPtr chatHwnd, Win32.POINT sampleClientPoint)
     {
-        Win32.GetWindowRect(chatHwnd, out var wndRect);
-        // 툴바 좌측 하단 모서리 근처에서 배경 픽셀 샘플링
-        int sampleX = wndRect.Left + 5;
-        int sampleY = wndRect.Bottom - 5;
+        var samplePoint = sampleClientPoint;
+        if (!Win32.ClientToScreen(chatHwnd, ref samplePoint)) return Color.White;
 
         IntPtr screenDc = Win32.GetDC(IntPtr.Zero);
         if (screenDc == IntPtr.Zero) return Color.White;
 
         try
         {
-            uint colorRef = Win32.GetPixel(screenDc, sampleX, sampleY);
+            uint colorRef = Win32.GetPixel(screenDc, samplePoint.X, samplePoint.Y);
             if (colorRef == Win32.CLR_INVALID) return Color.White;
             int red   = (int)(colorRef & 0xFF);
             int green = (int)((colorRef >> 8) & 0xFF);

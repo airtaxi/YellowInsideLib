@@ -193,6 +193,13 @@ static partial class Win32
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool ClientToScreen(IntPtr hwnd, ref POINT point);
+
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr GetForegroundWindow();
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsWindowVisible(IntPtr hwnd);
 
     [LibraryImport("user32.dll")]
@@ -238,6 +245,14 @@ static partial class Win32
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool SetWindowPos(
         IntPtr hwnd, IntPtr hwndInsertAfter, int x, int y, int width, int height, uint flags);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool ShowWindow(IntPtr hwnd, int command);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetLayeredWindowAttributes(IntPtr hwnd, uint colorKey, byte alpha, uint flags);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -299,6 +314,10 @@ static partial class Win32
     [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
     public static partial IntPtr DispatchMessage(in MSG message);
 
+    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool PeekMessage(out MSG message, IntPtr hwnd, uint filterMin, uint filterMax, uint removeMessage);
+
     [LibraryImport("user32.dll")]
     public static partial void PostQuitMessage(int exitCode);
 
@@ -320,6 +339,18 @@ static partial class Win32
     // ── 기타 ─────────────────────────────────────────────────────────────────────────────
     [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleW")]
     public static partial IntPtr GetModuleHandle(IntPtr moduleName);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleW", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial IntPtr GetModuleHandle(string moduleName);
+
+    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf8)]
+    public static partial IntPtr GetProcAddress(IntPtr module, string procedureName);
+
+    [LibraryImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    public static partial uint TimeBeginPeriod(uint periodMilliseconds);
+
+    [LibraryImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    public static partial uint TimeEndPeriod(uint periodMilliseconds);
 
     [LibraryImport("user32.dll", EntryPoint = "LoadCursorW")]
     public static partial IntPtr LoadCursor(IntPtr hInstance, int cursorName);
@@ -358,6 +389,23 @@ static partial class Win32
     [LibraryImport("user32.dll", SetLastError = true)]
     public static unsafe partial uint SendInput(uint numberOfInputs, INPUT* inputs, int sizeOfInput);
 
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetCursorPos(out POINT point);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetCursorPos(int x, int y);
+
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr WindowFromPoint(POINT point);
+
+    [LibraryImport("user32.dll")]
+    public static partial IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [LibraryImport("user32.dll")]
+    public static partial int GetSystemMetrics(int index);
+
     // ── 클립보드 ────────────────────────────────────────────────────────────────────────────
     [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -389,6 +437,35 @@ static partial class Win32
 
     [LibraryImport("user32.dll")]
     public static partial uint EnumClipboardFormats(uint format);
+
+    // ── COM (UI Automation) ─────────────────────────────────────────────────────────────────
+    [LibraryImport("ole32.dll")]
+    public static partial int CoInitializeEx(IntPtr reserved, uint coInit);
+
+    [LibraryImport("ole32.dll")]
+    public static partial void CoUninitialize();
+
+    [LibraryImport("ole32.dll")]
+    public static partial int CoCreateInstance(in Guid classId, IntPtr outer, uint classContext, in Guid interfaceId, out IntPtr instance);
+
+    public const uint COINIT_MULTITHREADED = 0x0;
+    public const uint CLSCTX_INPROC_SERVER = 0x1;
+
+    // ── OLE 드래그앤드롭 / 셸 ───────────────────────────────────────────────────────────────
+    [LibraryImport("ole32.dll")]
+    public static partial int OleInitialize(IntPtr reserved);
+
+    [LibraryImport("ole32.dll")]
+    public static partial void OleUninitialize();
+
+    [LibraryImport("ole32.dll")]
+    public static partial int DoDragDrop(IntPtr dataObject, IntPtr dropSource, uint okEffects, out uint effect);
+
+    [LibraryImport("shell32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    public static partial int SHParseDisplayName(string name, IntPtr bindContext, out IntPtr itemIdList, uint attributesIn, out uint attributesOut);
+
+    [LibraryImport("shell32.dll")]
+    public static unsafe partial int SHCreateShellItemArrayFromIDLists(uint count, IntPtr* itemIdLists, out IntPtr shellItemArray);
 
     // ── 메모리 할당 ────────────────────────────────────────────────────────────────────────
     [LibraryImport("kernel32.dll")]
@@ -484,7 +561,28 @@ static partial class Win32
     public const byte VK_V              = 0x56;
     public const byte VK_RETURN         = 0x0D;
 
+    public const uint INPUT_MOUSE           = 0;
+    public const uint MOUSEEVENTF_LEFTDOWN  = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP    = 0x0004;
+    public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+    public const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
+    public const int  SM_SWAPBUTTON         = 23;
+
+    public const uint WS_POPUP          = 0x80000000;
+    public const uint WS_EX_TOPMOST     = 0x00000008;
+    public const uint WS_EX_TOOLWINDOW  = 0x00000080;
+    public const uint WS_EX_LAYERED     = 0x00080000;
+    public const uint WS_EX_NOACTIVATE  = 0x08000000;
+    public const uint LWA_ALPHA         = 0x00000002;
+    public const int  SW_SHOWNOACTIVATE = 4;
+    public const int  SW_RESTORE        = 9;
+    public const uint PM_REMOVE         = 0x0001;
+    public const uint GA_ROOT           = 2;
+    public const int  COLOR_WINDOW      = 5;
+
     public static readonly IntPtr DPI_CONTEXT_PER_MONITOR_V2    = new IntPtr(-4);
     public static readonly IntPtr DPI_CONTEXT_UNAWARE_GDISCALED = new IntPtr(-5);
     public static readonly IntPtr HWND_TOP                      = IntPtr.Zero;
+    public static readonly IntPtr HWND_TOPMOST                  = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST                = new IntPtr(-2);
 }

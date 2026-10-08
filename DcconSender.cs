@@ -25,14 +25,15 @@ static class DcconSender
     // ── Public API (하위 호환) ────────────────────────────────────────────────
 
     public static Task<bool> SendDcconAsync(IntPtr chatWindowHandle, string filePath, Action<string>? log = null) =>
-        SendDcconAsync(chatWindowHandle, filePath, SendMethod.Auto, new LogSink(InfoLog: log, WarnLog: log, ErrorLog: log));
+        SendDcconAsync(chatWindowHandle, filePath, SendMethod.Auto, isQtMessengerWindow: false, new LogSink(InfoLog: log, WarnLog: log, ErrorLog: log));
 
     public static Task<bool> SendMultipleDcconsAsync(IntPtr chatWindowHandle, IEnumerable<string> filePaths, Action<string>? log = null) =>
-        SendMultipleDcconsAsync(chatWindowHandle, filePaths, SendMethod.Auto, new LogSink(InfoLog: log, WarnLog: log, ErrorLog: log));
+        SendMultipleDcconsAsync(chatWindowHandle, filePaths, SendMethod.Auto, isQtMessengerWindow: false, new LogSink(InfoLog: log, WarnLog: log, ErrorLog: log));
 
     // ── Public API (SendMethod 지정) ─────────────────────────────────────────
+    // isQtMessengerWindow: Qt 메신저(KakaoTalkUI.exe)의 창이면 파일 드롭을 OLE 드래그앤드롭으로 보낸다
 
-    public static async Task<bool> SendDcconAsync(IntPtr chatWindowHandle, string filePath, SendMethod sendMethod, LogSink? logSink = null)
+    public static async Task<bool> SendDcconAsync(IntPtr chatWindowHandle, string filePath, SendMethod sendMethod, bool isQtMessengerWindow, LogSink? logSink = null)
     {
         string fullPath = Path.GetFullPath(filePath);
         logSink?.Info($"[전송] 디시콘 전송 시작 — 대상: 0x{chatWindowHandle:X8}, 방식: {sendMethod}, 파일: {Path.GetFileName(filePath)}, 전체 경로: {fullPath}");
@@ -43,10 +44,10 @@ static class DcconSender
             return false;
         }
 
-        return await SendFilesAsync(chatWindowHandle, [fullPath], sendMethod, logSink);
+        return await SendFilesAsync(chatWindowHandle, [fullPath], sendMethod, isQtMessengerWindow, logSink);
     }
 
-    public static async Task<bool> SendMultipleDcconsAsync(IntPtr chatWindowHandle, IEnumerable<string> filePaths, SendMethod sendMethod, LogSink? logSink = null)
+    public static async Task<bool> SendMultipleDcconsAsync(IntPtr chatWindowHandle, IEnumerable<string> filePaths, SendMethod sendMethod, bool isQtMessengerWindow, LogSink? logSink = null)
     {
         var validFullPaths = new List<string>();
         int totalCount = 0;
@@ -72,13 +73,16 @@ static class DcconSender
             return false;
         }
 
-        return await SendFilesAsync(chatWindowHandle, validFullPaths, sendMethod, logSink);
+        return await SendFilesAsync(chatWindowHandle, validFullPaths, sendMethod, isQtMessengerWindow, logSink);
     }
 
     // ── 전송 방식 분기 ───────────────────────────────────────────────────────
 
-    static async Task<bool> SendFilesAsync(IntPtr chatWindowHandle, List<string> filePaths, SendMethod sendMethod, LogSink? logSink)
+    static async Task<bool> SendFilesAsync(IntPtr chatWindowHandle, List<string> filePaths, SendMethod sendMethod, bool isQtMessengerWindow, LogSink? logSink)
     {
+        // Qt 메신저는 WM_DROPFILES를 처리하지 않으므로 파일 드롭이 필요한 방식은 OLE 드래그앤드롭으로 보낸다
+        if (isQtMessengerWindow && sendMethod != SendMethod.Clipboard) return await SendViaQtDragDropAsync(chatWindowHandle, filePaths, sendMethod, logSink);
+
         switch (sendMethod)
         {
             case SendMethod.DropFiles:
@@ -98,6 +102,18 @@ static class DcconSender
             default:
                 return false;
         }
+    }
+
+    // ── OLE 드래그앤드롭 방식 (Qt 메신저 전용) ──────────────────────────────
+
+    static async Task<bool> SendViaQtDragDropAsync(IntPtr chatWindowHandle, List<string> filePaths, SendMethod sendMethod, LogSink? logSink)
+    {
+        logSink?.Info($"[전송] OLE 드래그앤드롭 방식 전송 시도 — 대상: 0x{chatWindowHandle:X8}, {filePaths.Count}개 파일");
+        if (await QtDragDropSender.SendAsync(chatWindowHandle, filePaths, logSink)) return true;
+        if (sendMethod != SendMethod.Auto) return false;
+
+        logSink?.Info($"[전송] OLE 드래그앤드롭 실패 → 클립보드 방식으로 재시도 — 대상: 0x{chatWindowHandle:X8}");
+        return await SendViaClipboardAsync(chatWindowHandle, filePaths, logSink);
     }
 
     // ── WM_DROPFILES 방식 (기존 로직) ────────────────────────────────────────
